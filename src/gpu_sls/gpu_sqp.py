@@ -153,6 +153,13 @@ def merit_function_factory(rho_merit, lambda_rem, remainder_func, eps_rem, distu
     @partial(jax.jit, static_argnames=("remainder_func", "disturbance"))
     def merit_fn(V, g, c, X, U, Phi_x_prev, Phi_u_prev, r_center_prev,
                  remainder_func=remainder_func, disturbance=disturbance):
+        base_merit = g + jnp.sum(V * c) + 0.5 * rho_merit * jnp.sum(c * c)
+        # A zero penalty needs no remainder evaluation or differentiation.
+        # In particular, external disturbance providers can be used without
+        # supplying the interval-only penalty callback.
+        if lambda_rem == 0:
+            return base_merit
+
         T = U.shape[0]
         nu = U.shape[1]
         t = jnp.arange(T + 1, dtype=X.dtype)[:, None]
@@ -173,7 +180,7 @@ def merit_function_factory(rho_merit, lambda_rem, remainder_func, eps_rem, distu
             X, U, eps_rem, tube_center_shift,
             remainder_func, disturbance, Phi_x_prev, Phi_u_prev, use_remainder_time,
         )
-        return g + jnp.sum(V * c) + 0.5 * rho_merit * jnp.sum(c * c) + lambda_rem * r
+        return base_merit + lambda_rem * r
         # return g + jnp.sum(V * c) + 0.5 * rho_merit * jnp.sum(c * c)
     return merit_fn
 

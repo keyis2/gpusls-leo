@@ -363,6 +363,22 @@ def get_combined_disturbance(
     disturbance_center,
     remainder_uses_time: bool,
 ):
+    """Combine external and model-error disturbance channels.
+
+    A caller-supplied ``remainder_func.combined_disturbance`` may construct
+    the complete ``(generators, center)`` pair directly. Its arguments are
+    ``(E, X, U, Phi_x, Phi_u, E_prev, r_center_prev, disturbance_center)``.
+    Returned arrays have shapes ``[T+1, nx, ne]`` and ``[T+1, nx]`` and
+    must match the solver's warm-start shapes. Row zero is the initial
+    uncertainty; transition k enters row k+1. The provider owns preservation
+    of the original predictor anchor, signed centers and shared generators.
+    """
+    if hasattr(remainder_func, "combined_disturbance"):
+        return remainder_func.combined_disturbance(
+            E, X, U, Phi_x, Phi_u, E_prev, r_center_prev,
+            disturbance_center,
+        )
+
     T = U.shape[0]
     nx = X.shape[1]
     nu = U.shape[1]
