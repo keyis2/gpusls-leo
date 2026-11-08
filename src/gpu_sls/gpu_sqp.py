@@ -368,26 +368,36 @@ def compute_search_direction(
         muN     = jnp.zeros((T + 1, nc))
         EN = jnp.zeros((T + 1, nx, nx + nx))
         r_centerN = jnp.zeros((T + 1, nx))
-        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN
+        result = (dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
+        if getattr(remainder_func, "closure_aware", False):
+            return result+(jnp.zeros(4, dtype=X.dtype),)
+        return result
 
     def run_sls(_):
-        dX, dU, dV, w1, y1, rho1, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = sls_solve_gpu(
+        sls_result = sls_solve_gpu(
             admm_config, remainder_func,
             Q, q, R, r, M, A, B, c,
             C_all, D_all, f_all, w, y, rho, sls_config, splits_cfg,
             E, E_prev, r_center_prev, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, X, U, disturbance_center
         )
-        return dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN
+        dX, dU, dV, w1, y1, rho1, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = sls_result[:15]
+        result = (dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
+        if getattr(remainder_func, "closure_aware", False):
+            return result+(sls_result[15].astype(X.dtype),)
+        return result
     
     use_nominal = jnp.logical_or(
         jnp.logical_not(sls_config.enable_fastsls),
         jnp.logical_and(sls_config.initialize_nominal, sqp_iteration < sls_config.max_initial_sqp_iterations)
     )
-    dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = lax.cond(
+    search_result = lax.cond(
         use_nominal, run_nominal, run_sls, operand=None
     )
-    # jax.debug.print("{}", use_nominal)
-    return dX, dU, dV, q, r, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN
+    dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = search_result[:13]
+    result = (dX, dU, dV, q, r, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
+    if getattr(remainder_func, "closure_aware", False):
+        return result+(search_result[13],)
+    return result
 
 
 @partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8,9))
@@ -414,7 +424,7 @@ def sqp(
     model_evaluator = partial(model_evaluator_helper, _cost, _dynamics, x0)
 
     def body(i, carry):
-        i, X_curr, U_curr, V_curr, w, y, rho, converged, backoffs, Phi_x, Phi_u, beta_ws, mu_w, E_prev, r_center_prev = carry
+        i, X_curr, U_curr, V_curr, w, y, rho, converged, backoffs, Phi_x, Phi_u, beta_ws, mu_w, E_prev, r_center_prev, sls_status = carry
 
         def do_nothing(_):
             return carry
@@ -428,7 +438,7 @@ def sqp(
             y0   = lax.select(warm_flag, y, jnp.zeros_like(y))
             rho0 = lax.select(warm_flag, rho, jnp.asarray(admm_config.initial_rho, dtype=rho.dtype))
             h_ct_ws = backoffs
-            dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN, EN, r_centerN = compute_search_direction(
+            direction = compute_search_direction(
                 sqp_config, sls_config, admm_config,
                 _cost, _dynamics, _hessian_approx,
                 constraints, disturbance,
@@ -440,6 +450,8 @@ def sqp(
                 Q_bar, R_bar,
                 h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, E_prev, r_center_prev, Phi_x, Phi_u
             )
+            dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN, EN, r_centerN = direction[:15]
+            next_sls_status = direction[15] if getattr(remainder_func, "closure_aware", False) else sls_status
 
             step = jnp.maximum(
                 jnp.max(jnp.abs(dX)),
@@ -556,13 +568,16 @@ def sqp(
 
             return (i_new + 1, X_next, U_next, V_next, w_next, y_next, rho_next,
                     converged1_new,
-                    backoffs_next, Phi_x_next, Phi_u_next, betaN, muN, EN, r_centerN)
+                    backoffs_next, Phi_x_next, Phi_u_next, betaN, muN, EN, r_centerN, next_sls_status)
 
         return lax.cond(converged, do_nothing, do_iter, operand=None)
 
     backoffs0 = h_ct_ws
-    carry0 = (0, X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x_ws, Phi_u_ws, beta_ws, mu_ws, E_prev, r_center_prev)
-    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = lax.fori_loop(
+    carry0 = (0, X_in, U_in, V_in, w, y, rho, jnp.array(False), backoffs0, Phi_x_ws, Phi_u_ws, beta_ws, mu_ws, E_prev, r_center_prev, jnp.zeros(4, dtype=X_in.dtype))
+    total_iterations, X_out, U_out, V_out, w_out, y_out, rho_out, converged, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN, sls_status = lax.fori_loop(
         0, sqp_config.max_sqp_iterations + sls_config.max_initial_sqp_iterations, body, carry0
     )
-    return X_out, U_out, V_out, w_out, y_out, rho_out, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN
+    result = (X_out, U_out, V_out, w_out, y_out, rho_out, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
+    if getattr(remainder_func, "closure_aware", False):
+        return result+(sls_status,)
+    return result

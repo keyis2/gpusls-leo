@@ -478,14 +478,16 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
 
     h_ct0 = h_ct_ws
     r_center0 = r_center_prev
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0)
+    closure_aware = bool(getattr(remainder_func, "closure_aware", False))
+    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0, jnp.array(True), converged0)
 
     def cond_fn(carry):
-        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _ = carry
-        return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
+        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, proof_valid, _ = carry
+        return (i < max_iter) & ~converged & proof_valid
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu, E_prev, r_center = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu, E_prev, r_center, proof_valid, _ = carry
+        r_center_input = r_center
         if sls_config.enable_linearization_bounds:
             E_aug, r_center = get_combined_disturbance(E, X, U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center, disturbance_center, sls_config.remainder_uses_time)
         else:
@@ -527,12 +529,22 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         rho = jnp.asarray(rho, dtype=prev_rho.dtype)
         w   = jnp.asarray(w,   dtype=w.dtype)
         y   = jnp.asarray(y,   dtype=y.dtype)
-        converged_now = metric <= tol
+        nominal_converged = metric <= tol
+        converged_now = nominal_converged
+        if closure_aware:
+            closed, proof_valid = remainder_func.sls_candidate_check(
+                i+1, X, U, x_curr, u_curr, Phi_x, Phi_u, E_aug, r_center,
+                metric, tol, (Phi_x_prev, Phi_u_prev, E_prev, r_center_input),
+                (v_curr, w, y, rho, beta, mu, h_ct))
+            converged_now = nominal_converged & closed & proof_valid
         converged = jnp.logical_or(converged, converged_now)
 
         return (i + jnp.array(1, dtype=jnp.int32),
-                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, E_aug, r_center)
+                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, E_aug, r_center, proof_valid, nominal_converged)
 
     carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
-    _, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, EN, r_centerN = carryN
-    return xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, EN, r_centerN
+    count, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, EN, r_centerN, proof_valid, nominal_converged = carryN
+    result = (xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
+    if closure_aware:
+        return result+(jnp.stack((count, nominal_converged, proof_valid, convergedN)),)
+    return result
