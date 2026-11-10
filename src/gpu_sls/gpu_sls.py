@@ -479,6 +479,7 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
     h_ct0 = h_ct_ws
     r_center0 = r_center_prev
     closure_aware = bool(getattr(remainder_func, "closure_aware", False))
+    candidate_centered = closure_aware and bool(getattr(remainder_func, "candidate_centered", False))
     carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0, jnp.array(True), converged0)
 
     def cond_fn(carry):
@@ -488,14 +489,18 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
     def body_fn(carry):
         i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu, E_prev, r_center, proof_valid, _ = carry
         r_center_input = r_center
+        x_prev = x_curr
+        u_prev = u_curr
+        # Opt-in query correction is relative to the fixed outer nominal;
+        # it neither accumulates directions nor relinearizes A/B/predictors.
+        bound_X = X+x_prev if candidate_centered else X
+        bound_U = U+u_prev if candidate_centered else U
         if sls_config.enable_linearization_bounds:
-            E_aug, r_center = get_combined_disturbance(E, X, U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center, disturbance_center, sls_config.remainder_uses_time)
+            E_aug, r_center = get_combined_disturbance(E, bound_X, bound_U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center, disturbance_center, sls_config.remainder_uses_time)
         else:
             E_aug = get_combined_zeros(E)
             r_center = disturbance_center
         prev_rho = rho
-        x_prev = x_curr
-        u_prev = u_curr
         num_regular_constraints = f.shape[1] - num_obstacles
         if sls_config.rti:
             mu_nominal = mu[: , :num_regular_constraints]
@@ -532,9 +537,12 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         nominal_converged = metric <= tol
         converged_now = nominal_converged
         if closure_aware:
+            previous = (Phi_x_prev, Phi_u_prev, E_prev, r_center_input)
+            if candidate_centered:
+                previous += (x_prev, u_prev)
             closed, proof_valid = remainder_func.sls_candidate_check(
                 i+1, X, U, x_curr, u_curr, Phi_x, Phi_u, E_aug, r_center,
-                metric, tol, (Phi_x_prev, Phi_u_prev, E_prev, r_center_input),
+                metric, tol, previous,
                 (v_curr, w, y, rho, beta, mu, h_ct))
             converged_now = nominal_converged & closed & proof_valid
         converged = jnp.logical_or(converged, converged_now)
