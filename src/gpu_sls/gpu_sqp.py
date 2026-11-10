@@ -149,7 +149,7 @@ def add_obstacle_constraints(C: jnp.ndarray, D: jnp.ndarray, f: jnp.ndarray,
     
     return C_all, D_all, f_all
 
-def merit_function_factory(rho_merit, lambda_rem, remainder_func, eps_rem, disturbance, use_remainder_time):
+def merit_function_factory(rho_merit, lambda_rem, remainder_func, eps_rem, disturbance, use_remainder_time, parameter=None):
     @partial(jax.jit, static_argnames=("remainder_func", "disturbance"))
     def merit_fn(V, g, c, X, U, Phi_x_prev, Phi_u_prev, r_center_prev,
                  remainder_func=remainder_func, disturbance=disturbance):
@@ -178,7 +178,7 @@ def merit_function_factory(rho_merit, lambda_rem, remainder_func, eps_rem, distu
 
         r = remainder_penalty(
             X, U, eps_rem, tube_center_shift,
-            remainder_func, disturbance, Phi_x_prev, Phi_u_prev, use_remainder_time,
+            remainder_func, disturbance, Phi_x_prev, Phi_u_prev, use_remainder_time, parameter,
         )
         return base_merit + lambda_rem * r
         # return g + jnp.sum(V * c) + 0.5 * rho_merit * jnp.sum(c * c)
@@ -224,6 +224,7 @@ def remainder_penalty(
     Phi_x,
     Phi_u,
     remainder_uses_time: bool,
+    parameter=None,
 ):
     T = U_.shape[0]
 
@@ -244,7 +245,8 @@ def remainder_penalty(
     z_nom = 0.5 * (z_lo + z_up)
     z_eps = 0.5 * (z_up - z_lo)
 
-    r_interval = remainder_func(z_nom, z_eps)
+    r_interval = (remainder_func(z_nom, z_eps) if parameter is None
+                  else remainder_func(z_nom, z_eps, parameter=parameter))
 
     r_lower = r_interval.lower
     r_upper = r_interval.upper
@@ -260,7 +262,7 @@ def remainder_penalty(
     return jnp.sum(x_width) + jnp.sum(u_width)
 
 @partial(jax.jit, static_argnames=("sls_config","remainder_func", "disturbance"))
-def get_remainder_gradients(sls_config,X, U, Phi_x_prev, Phi_u_prev, E_prev, r_center_prev, remainder_func, disturbance):
+def get_remainder_gradients(sls_config,X, U, Phi_x_prev, Phi_u_prev, E_prev, r_center_prev, remainder_func, disturbance, parameter=None):
     T = U.shape[0]
     nu = U.shape[1]
     t = jnp.arange(T + 1, dtype=X.dtype)[:, None]
@@ -282,7 +284,7 @@ def get_remainder_gradients(sls_config,X, U, Phi_x_prev, Phi_u_prev, E_prev, r_c
     _, (grad_X_rem, grad_U_rem) = jax.value_and_grad(
         remainder_penalty,
         argnums=(0, 1)
-    )(X, U, z_width, tube_center_shift, remainder_func, disturbance, Phi_x_prev, Phi_u_prev, sls_config.remainder_uses_time)
+    )(X, U, z_width, tube_center_shift, remainder_func, disturbance, Phi_x_prev, Phi_u_prev, sls_config.remainder_uses_time, parameter)
     grad_X_rem = grad_X_rem.at[0].set(0.0)
     return grad_X_rem, grad_U_rem
 
@@ -298,7 +300,22 @@ def compute_search_direction(
     w, y, rho,
     Q_bar, R_bar,
     h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, E_prev, r_center_prev, Phi_x_prev, Phi_u_prev,
+    parameter=None,
 ):
+    """Compute one direction with optional live numerical model parameters.
+
+    ``parameter`` binds dynamics' keyword argument inside this trace. Providers
+    declaring ``uses_parameter`` receive the same pytree explicitly in all
+    remainder paths; legacy callbacks keep their original arity. Closure-aware
+    providers add status at index 15. Their static ``return_round_records`` mode
+    adds a fixed-size records/valid/count payload at index 16 for host persistence.
+    This collection protocol belongs to a direct direction call; sqp() returns
+    its established optimizer outputs.
+    """
+    # Bind numerical model inputs inside the trace, never in a static callback.
+    if parameter is not None:
+        dynamics = partial(dynamics, parameter=parameter)
+    remainder_parameter = parameter if getattr(remainder_func, "uses_parameter", False) else None
     T = U.shape[0]
     nx = X.shape[1]
     nu = U.shape[1]
@@ -319,7 +336,7 @@ def compute_search_direction(
     q, r_pad = linearizer(X, pad(U), jnp.arange(T + 1), pad(V[1:]), V)
     r = r_pad[:-1]
     if sls_config.enable_linearization_gradients:
-        grad_X_rem, grad_U_rem = get_remainder_gradients(sls_config, X, U, Phi_x_prev, Phi_u_prev, E_prev, r_center_prev, remainder_func, disturbance)
+        grad_X_rem, grad_U_rem = get_remainder_gradients(sls_config, X, U, Phi_x_prev, Phi_u_prev, E_prev, r_center_prev, remainder_func, disturbance, remainder_parameter)
         t = sqp_iteration / jnp.maximum(
             sls_config.max_initial_sqp_iterations + sqp_config.max_sqp_iterations - 1,
             1,
@@ -370,7 +387,12 @@ def compute_search_direction(
         r_centerN = jnp.zeros((T + 1, nx))
         result = (dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
         if getattr(remainder_func, "closure_aware", False):
-            return result+(jnp.zeros(4, dtype=X.dtype),)
+            result += (jnp.zeros(4, dtype=X.dtype),)
+            if getattr(remainder_func, "return_round_records", False):
+                result += (remainder_func.empty_round_records(
+                    sls_config.max_sls_iterations, X, U, V, w, y, rho,
+                    beta_ws, mu_ws, h_ct_ws, Phi_x_ws, Phi_u_ws, E_prev, r_center_prev),)
+            return result
         return result
 
     def run_sls(_):
@@ -378,12 +400,12 @@ def compute_search_direction(
             admm_config, remainder_func,
             Q, q, R, r, M, A, B, c,
             C_all, D_all, f_all, w, y, rho, sls_config, splits_cfg,
-            E, E_prev, r_center_prev, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, X, U, disturbance_center
+            E, E_prev, r_center_prev, Q_bar, R_bar, obstacles, X, h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, X, U, disturbance_center, remainder_parameter
         )
         dX, dU, dV, w1, y1, rho1, converged, converged_admm, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = sls_result[:15]
         result = (dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
         if getattr(remainder_func, "closure_aware", False):
-            return result+(sls_result[15].astype(X.dtype),)
+            return result+(sls_result[15].astype(X.dtype),)+sls_result[16:]
         return result
     
     use_nominal = jnp.logical_or(
@@ -396,7 +418,7 @@ def compute_search_direction(
     dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = search_result[:13]
     result = (dX, dU, dV, q, r, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
     if getattr(remainder_func, "closure_aware", False):
-        return result+(search_result[13],)
+        return result+(search_result[13],)+search_result[14:]
     return result
 
 
@@ -440,7 +462,7 @@ def sqp(
             h_ct_ws = backoffs
             direction = compute_search_direction(
                 sqp_config, sls_config, admm_config,
-                _cost, _dynamics, _hessian_approx,
+                _cost, _dynamics if parameter is None else dynamics, _hessian_approx,
                 constraints, disturbance,
                 remainder_func, splits_cfg,
                 i,
@@ -448,7 +470,7 @@ def sqp(
                 x0, X_curr, U_curr, V_curr, c,
                 w0, y0, rho0,
                 Q_bar, R_bar,
-                h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, E_prev, r_center_prev, Phi_x, Phi_u
+                h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, E_prev, r_center_prev, Phi_x, Phi_u, parameter
             )
             dX, dU, dV, q, r, w1, y1, rho1, backoffs1, Phi_x1, Phi_u1, betaN, muN, EN, r_centerN = direction[:15]
             next_sls_status = direction[15] if getattr(remainder_func, "closure_aware", False) else sls_status
@@ -485,7 +507,8 @@ def sqp(
                 remainder_func,
                 z_width,
                 disturbance,
-                sls_config.remainder_uses_time
+                sls_config.remainder_uses_time,
+                parameter if getattr(remainder_func, "uses_parameter", False) else None,
             )
             current_merit = merit_fn(V_curr, g, c, X_curr, U_curr, Phi_x1, Phi_u1, r_center_prev)
             merit_slope = slope(dX, dU, dV, c, q, r, rho_merit)

@@ -362,6 +362,7 @@ def get_combined_disturbance(
     r_center_prev,
     disturbance_center,
     remainder_uses_time: bool,
+    parameter=None,
 ):
     """Combine external and model-error disturbance channels.
 
@@ -372,11 +373,14 @@ def get_combined_disturbance(
     must match the solver's warm-start shapes. Row zero is the initial
     uncertainty; transition k enters row k+1. The provider owns preservation
     of the original predictor anchor, signed centers and shared generators.
+    An explicitly supplied parameter pytree reaches a parameterized provider as
+    a keyword; the default preserves the original provider signature.
     """
     if hasattr(remainder_func, "combined_disturbance"):
         return remainder_func.combined_disturbance(
             E, X, U, Phi_x, Phi_u, E_prev, r_center_prev,
             disturbance_center,
+            **({} if parameter is None else {"parameter": parameter}),
         )
 
     T = U.shape[0]
@@ -427,7 +431,8 @@ def get_combined_disturbance(
     z_nom = 0.5 * (z_lo + z_up)
     z_eps = 0.5 * (z_up - z_lo)
 
-    r_interval = remainder_func(z_nom, z_eps)
+    r_interval = (remainder_func(z_nom, z_eps) if parameter is None
+                  else remainder_func(z_nom, z_eps, parameter=parameter))
 
     r_lower = r_interval.lower
     r_upper = r_interval.upper
@@ -457,7 +462,13 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
                        w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
                        sls_config: SLSConfig, splits_cfg, E: jnp.ndarray, E_prev: jnp.ndarray, r_center_prev: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
                        obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
-                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray, X: jnp.ndarray, U: jnp.ndarray, disturbance_center: jnp.ndarray):
+                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray, X: jnp.ndarray, U: jnp.ndarray, disturbance_center: jnp.ndarray, parameter=None):
+    """Run the unchanged SLS fixed point, optionally returning round records.
+
+    The static provider collection mode appends records/valid/count after the
+    closure status. Slot r-1 stores executed round r, even when its proof fails;
+    all unexecuted slots have a false mask and do not represent solver rounds.
+    """
     Tp1 = Q.shape[0]
     nx  = Q.shape[1]
     nu  = R.shape[1]
@@ -480,14 +491,17 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
     r_center0 = r_center_prev
     closure_aware = bool(getattr(remainder_func, "closure_aware", False))
     candidate_centered = closure_aware and bool(getattr(remainder_func, "candidate_centered", False))
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0, jnp.array(True), converged0)
+    return_records = closure_aware and bool(getattr(remainder_func, "return_round_records", False))
+    records0 = (remainder_func.empty_round_records(sls_config.max_sls_iterations, X, U, v0, w, y, rho, beta_ws, mu_ws, h_ct0, Phi_x_ws, Phi_u_ws, E_prev, r_center0)
+                if return_records else ())
+    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0, jnp.array(True), converged0, records0)
 
     def cond_fn(carry):
-        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, proof_valid, _ = carry
+        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, proof_valid, _, _ = carry
         return (i < max_iter) & ~converged & proof_valid
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu, E_prev, r_center, proof_valid, _ = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu, E_prev, r_center, proof_valid, _, records = carry
         r_center_input = r_center
         x_prev = x_curr
         u_prev = u_curr
@@ -496,7 +510,7 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         bound_X = X+x_prev if candidate_centered else X
         bound_U = U+u_prev if candidate_centered else U
         if sls_config.enable_linearization_bounds:
-            E_aug, r_center = get_combined_disturbance(E, bound_X, bound_U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center, disturbance_center, sls_config.remainder_uses_time)
+            E_aug, r_center = get_combined_disturbance(E, bound_X, bound_U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center, disturbance_center, sls_config.remainder_uses_time, parameter)
         else:
             E_aug = get_combined_zeros(E)
             r_center = disturbance_center
@@ -540,19 +554,25 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
             previous = (Phi_x_prev, Phi_u_prev, E_prev, r_center_input)
             if candidate_centered:
                 previous += (x_prev, u_prev)
-            closed, proof_valid = remainder_func.sls_candidate_check(
+            check = remainder_func.sls_candidate_check(
                 i+1, X, U, x_curr, u_curr, Phi_x, Phi_u, E_aug, r_center,
                 metric, tol, previous,
-                (v_curr, w, y, rho, beta, mu, h_ct))
+                (v_curr, w, y, rho, beta, mu, h_ct),
+                **({} if parameter is None else {"parameter": parameter}))
+            closed, proof_valid = check[:2]
+            if return_records:
+                index = i.astype(jnp.int32)
+                records = dict(records=jax.tree.map(lambda rows, value: rows.at[index].set(value), records["records"], check[2]),
+                               valid=records["valid"].at[index].set(True), count=index+1)
             converged_now = nominal_converged & closed & proof_valid
         converged = jnp.logical_or(converged, converged_now)
 
         return (i + jnp.array(1, dtype=jnp.int32),
-                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, E_aug, r_center, proof_valid, nominal_converged)
+                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, E_aug, r_center, proof_valid, nominal_converged, records)
 
     carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
-    count, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, EN, r_centerN, proof_valid, nominal_converged = carryN
+    count, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, EN, r_centerN, proof_valid, nominal_converged, records = carryN
     result = (xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
     if closure_aware:
-        return result+(jnp.stack((count, nominal_converged, proof_valid, convergedN)),)
+        return result+(jnp.stack((count, nominal_converged, proof_valid, convergedN)),)+((records,) if return_records else ())
     return result
