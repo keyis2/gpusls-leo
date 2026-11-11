@@ -491,17 +491,20 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
     r_center0 = r_center_prev
     closure_aware = bool(getattr(remainder_func, "closure_aware", False))
     candidate_centered = closure_aware and bool(getattr(remainder_func, "candidate_centered", False))
+    reuse_candidate_certificate = (candidate_centered and sls_config.enable_linearization_bounds
+                                   and bool(getattr(remainder_func, "reuse_candidate_certificate", False)))
     return_records = closure_aware and bool(getattr(remainder_func, "return_round_records", False))
     records0 = (remainder_func.empty_round_records(sls_config.max_sls_iterations, X, U, v0, w, y, rho, beta_ws, mu_ws, h_ct0, Phi_x_ws, Phi_u_ws, E_prev, r_center0)
                 if return_records else ())
-    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0, jnp.array(True), converged0, records0)
+    certificate0 = remainder_func.empty_candidate_certificate(X) if reuse_candidate_certificate else ()
+    carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0, jnp.array(True), converged0, records0, certificate0)
 
     def cond_fn(carry):
-        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, proof_valid, _, _ = carry
+        i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, proof_valid, _, _, _ = carry
         return (i < max_iter) & ~converged & proof_valid
 
     def body_fn(carry):
-        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu, E_prev, r_center, proof_valid, _, records = carry
+        i, beta, x_curr, u_curr, v_curr, w, y, rho, converged, _, h_ct, Phi_x_prev, Phi_u_prev, mu, E_prev, r_center, proof_valid, _, records, previous_certificate = carry
         r_center_input = r_center
         x_prev = x_curr
         u_prev = u_curr
@@ -510,7 +513,18 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         bound_X = X+x_prev if candidate_centered else X
         bound_U = U+u_prev if candidate_centered else U
         if sls_config.enable_linearization_bounds:
-            E_aug, r_center = get_combined_disturbance(E, bound_X, bound_U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center, disturbance_center, sls_config.remainder_uses_time, parameter)
+            def evaluate_disturbance(_):
+                return get_combined_disturbance(E, bound_X, bound_U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center_input, disturbance_center, sls_config.remainder_uses_time, parameter)
+            if reuse_candidate_certificate:
+                # At k+1, (X+dx_k,U+du_k,Phi_k,E_k,center_k) is exactly the
+                # query certified by candidate check k. Numerical parameters
+                # stay fixed within this call. Only the shared lift is repeated;
+                # the first query and every fresh candidate still run the oracle.
+                E_aug, r_center = lax.cond(i == 0, evaluate_disturbance,
+                    lambda _: remainder_func.combined_disturbance_from_certificate(
+                        E, bound_X, previous_certificate, disturbance_center), operand=None)
+            else:
+                E_aug, r_center = evaluate_disturbance(None)
         else:
             E_aug = get_combined_zeros(E)
             r_center = disturbance_center
@@ -558,8 +572,11 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
                 i+1, X, U, x_curr, u_curr, Phi_x, Phi_u, E_aug, r_center,
                 metric, tol, previous,
                 (v_curr, w, y, rho, beta, mu, h_ct),
+                **({"return_candidate_certificate": True} if reuse_candidate_certificate else {}),
                 **({} if parameter is None else {"parameter": parameter}))
             closed, proof_valid = check[:2]
+            if reuse_candidate_certificate:
+                previous_certificate = check[-1]
             if return_records:
                 index = i.astype(jnp.int32)
                 records = dict(records=jax.tree.map(lambda rows, value: rows.at[index].set(value), records["records"], check[2]),
@@ -568,10 +585,10 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         converged = jnp.logical_or(converged, converged_now)
 
         return (i + jnp.array(1, dtype=jnp.int32),
-                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, E_aug, r_center, proof_valid, nominal_converged, records)
+                beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, E_aug, r_center, proof_valid, nominal_converged, records, previous_certificate)
 
     carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
-    count, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, EN, r_centerN, proof_valid, nominal_converged, records = carryN
+    count, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, EN, r_centerN, proof_valid, nominal_converged, records, _ = carryN
     result = (xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
     if closure_aware:
         return result+(jnp.stack((count, nominal_converged, proof_valid, convergedN)),)+((records,) if return_records else ())
