@@ -12,8 +12,8 @@ from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.optimizers import (
     model_evaluator_helper,
     slope,
 )
-from gpu_sls.gpu_admm import ADMMConfig, constrained_solve
-from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu, get_tube_width
+from gpu_sls.gpu_admm import ADMMConfig, constrained_solve, constrained_solve_jit
+from gpu_sls.gpu_sls import SLSConfig, sls_solve_gpu, sls_solve_host, get_tube_width
 from gpu_sls.osqp_admm import constrained_solve_osqp
 
 
@@ -289,6 +289,27 @@ def get_remainder_gradients(sls_config,X, U, Phi_x_prev, Phi_u_prev, E_prev, r_c
     return grad_X_rem, grad_U_rem
 
 
+@partial(jit, static_argnums=(0, 1, 2, 3, 4))
+def _direction_problem(cost, dynamics, hessian_approx, constraints, disturbance,
+                       obstacles, x0, X, U, V, parameter):
+    if parameter is not None:
+        dynamics = partial(dynamics, parameter=parameter)
+    T = U.shape[0]
+    pad = lambda value: jnp.pad(value, ((0, 1), (0, 0)))
+    times = jnp.arange(T + 1)
+    U_pad = pad(U)
+    if hessian_approx is None:
+        Q, R_pad, M_pad = quadratize(cost)(X, U_pad, times)
+    else:
+        Q, R_pad, M_pad = jax.vmap(hessian_approx)(X, U_pad, times)
+    q, r_pad = linearize(lagrangian(cost, dynamics, x0), argnums=5)(X, U_pad, times, pad(V[1:]), V)
+    A_pad, B_pad = linearize(dynamics)(X, U_pad, times)
+    f = -vectorize(constraints)(X, U_pad, times)
+    C, D = linearize(constraints)(X, U_pad, times)
+    C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
+    return Q, q, R_pad[:-1], r_pad[:-1], M_pad[:-1], A_pad[:-1], B_pad[:-1], C_all, D_all, f_all, disturbance(X)
+
+
 @partial(jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9))
 def compute_search_direction(
     sqp_config: SQPConfig, sls_config: SLSConfig, admm_config: ADMMConfig,
@@ -300,7 +321,7 @@ def compute_search_direction(
     w, y, rho,
     Q_bar, R_bar,
     h_ct_ws, beta_ws, mu_ws, Phi_x_ws, Phi_u_ws, E_prev, r_center_prev, Phi_x_prev, Phi_u_prev,
-    parameter=None,
+    parameter=None, *, _host_dispatch=False,
 ):
     """Compute one direction with optional live numerical model parameters.
 
@@ -312,30 +333,17 @@ def compute_search_direction(
     This collection protocol belongs to a direct direction call; sqp() returns
     its established optimizer outputs.
     """
-    # Bind numerical model inputs inside the trace, never in a static callback.
-    if parameter is not None:
-        dynamics = partial(dynamics, parameter=parameter)
     remainder_parameter = parameter if getattr(remainder_func, "uses_parameter", False) else None
     T = U.shape[0]
     nx = X.shape[1]
     nu = U.shape[1]
     nc = w.shape[1]
-    pad = lambda A: jnp.pad(A, [[0, 1], [0, 0]])
-
-    if hessian_approx is None:
-        quadratizer = quadratize(cost)
-        Q, R_pad, M_pad = quadratizer(X, pad(U), jnp.arange(T + 1))
-    else:
-        Q, R_pad, M_pad = jax.vmap(hessian_approx)(X, pad(U), jnp.arange(T + 1))
-
-    R = R_pad[:-1]
-    M = M_pad[:-1]
-
-    linearizer = linearize(lagrangian(cost, dynamics, x0), argnums=5)
-    dynamics_linearizer = linearize(dynamics)
-    q, r_pad = linearizer(X, pad(U), jnp.arange(T + 1), pad(V[1:]), V)
-    r = r_pad[:-1]
+    build_problem = _direction_problem if _host_dispatch else _direction_problem.__wrapped__
+    Q, q, R, r, M, A, B, C_all, D_all, f_all, E = build_problem(
+        cost, dynamics, hessian_approx, constraints, disturbance, obstacles, x0, X, U, V, parameter)
     if sls_config.enable_linearization_gradients:
+        if _host_dispatch:
+            raise ValueError('host certificate dispatch requires linearization gradients to be disabled')
         grad_X_rem, grad_U_rem = get_remainder_gradients(sls_config, X, U, Phi_x_prev, Phi_u_prev, E_prev, r_center_prev, remainder_func, disturbance, remainder_parameter)
         t = sqp_iteration / jnp.maximum(
             sls_config.max_initial_sqp_iterations + sqp_config.max_sqp_iterations - 1,
@@ -347,23 +355,9 @@ def compute_search_direction(
         q = q + weight * grad_X_rem
         r = r + weight * grad_U_rem
 
-    # jax.debug.print("q: {}", q)
-
-
-    A_pad, B_pad = dynamics_linearizer(X, pad(U), jnp.arange(T + 1))
-    A = A_pad[:-1]
-    B = B_pad[:-1]
-
-    pad = lambda A: jnp.pad(A, ((0, 1), (0, 0)))
-    U_pad = pad(U)
-    t = jnp.arange(X.shape[0])
-    g = vectorize(constraints)(X, U_pad, t)
-    f = -g
-    C, D = linearize(constraints)(X, U_pad, t)
-    C_all, D_all, f_all = add_obstacle_constraints(C, D, f, obstacles, X)
-    E = disturbance(X)
-
     n_obs = obstacles.shape[0]
+    solve_nominal = constrained_solve_jit if _host_dispatch else constrained_solve
+    solve_sls = sls_solve_host if _host_dispatch else sls_solve_gpu
 
     def run_nominal(_):
         if admm_config.use_oqsp:
@@ -375,7 +369,7 @@ def compute_search_direction(
             Phi_u = jnp.zeros((T, T + 1, nu, nx))
             rho1 = jnp.zeros_like(rho)
         else:
-            dX, dU, dV, w1, y1, rho1, _, converged_admm = constrained_solve(
+            dX, dU, dV, w1, y1, rho1, _, converged_admm = solve_nominal(
                 admm_config, Q, q, R, r, M, A, B, c, C_all, D_all, f_all, w, y, rho
             )
         backoffs = jnp.zeros((T + 1, nc - n_obs))
@@ -396,7 +390,7 @@ def compute_search_direction(
         return result
 
     def run_sls(_):
-        sls_result = sls_solve_gpu(
+        sls_result = solve_sls(
             admm_config, remainder_func,
             Q, q, R, r, M, A, B, c,
             C_all, D_all, f_all, w, y, rho, sls_config, splits_cfg,
@@ -412,14 +406,20 @@ def compute_search_direction(
         jnp.logical_not(sls_config.enable_fastsls),
         jnp.logical_and(sls_config.initialize_nominal, sqp_iteration < sls_config.max_initial_sqp_iterations)
     )
-    search_result = lax.cond(
-        use_nominal, run_nominal, run_sls, operand=None
-    )
+    if _host_dispatch:
+        search_result = (run_nominal if bool(use_nominal) else run_sls)(None)
+    else:
+        search_result = lax.cond(use_nominal, run_nominal, run_sls, operand=None)
     dX, dU, dV, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN = search_result[:13]
     result = (dX, dU, dV, q, r, w1, y1, rho1, backoffs, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
     if getattr(remainder_func, "closure_aware", False):
         return result+(search_result[13],)+search_result[14:]
     return result
+
+
+def compute_search_direction_host(*args, **kwargs):
+    """Compute a direction with standalone certificate dispatch between SLS rounds."""
+    return compute_search_direction.__wrapped__(*args, **kwargs, _host_dispatch=True)
 
 
 @partial(jit, static_argnums=(0,1,2,3,4,5,6,7,8,9))

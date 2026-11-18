@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 
 dependencies = [
     "jax>=0.8.1,<0.9",
-    "trajax @ git+https://github.com/google/trajax",
+    "trajax @ git+https://github.com/google/trajax.git@c94a637c5a397b3d4100153f25b4b165507b5b20",
     "numpy",
     "scipy",
     "osqp",

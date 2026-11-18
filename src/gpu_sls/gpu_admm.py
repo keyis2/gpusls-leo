@@ -546,3 +546,6 @@ def constrained_solve(cfg: ADMMConfig, Q, q, R, r, M, A, B, c, C, D, f, w, y, rh
     v = dual_lqr(x_bar, P_final, p_final)
     mu = rho_final * y_bar
     return x_bar, u_bar[:-1], v, w_bar, y_bar, rho_final, mu, converged
+
+
+constrained_solve_jit = jax.jit(constrained_solve, static_argnums=(0,))

@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 from jax import jit, lax, vmap
 
-from gpu_sls.gpu_admm import constrained_solve
+from gpu_sls.gpu_admm import constrained_solve, constrained_solve_jit
 from gpu_sls.external.primal_dual_ilqr.primal_dual_ilqr.primal_tvlqr import tvlqr_gpu
 # from gpu_sls.external.linearization_sls.src.helper import make_step_boxes, build_linear_tm, prepare_initial_set
 # from gpu_sls.external.linearization_sls.src.taylor_model import LinTM
@@ -462,7 +462,8 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
                        w: jnp.ndarray, y: jnp.ndarray, rho: jnp.ndarray, # ADMM Params
                        sls_config: SLSConfig, splits_cfg, E: jnp.ndarray, E_prev: jnp.ndarray, r_center_prev: jnp.ndarray, Q_bar: jnp.ndarray, R_bar: jnp.ndarray,
                        obstacles: jnp.ndarray, primal_pos: jnp.ndarray, h_ct_ws: jnp.ndarray,
-                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray, X: jnp.ndarray, U: jnp.ndarray, disturbance_center: jnp.ndarray, parameter=None):
+                       beta_ws: jnp.ndarray, mu_ws: jnp.ndarray, Phi_x_ws: jnp.ndarray, Phi_u_ws: jnp.ndarray, X: jnp.ndarray, U: jnp.ndarray, disturbance_center: jnp.ndarray, parameter=None,
+                       *, _host_dispatch=False):
     """Run the unchanged SLS fixed point, optionally returning round records.
 
     The static provider collection mode appends records/valid/count after the
@@ -498,6 +499,8 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
                 if return_records else ())
     certificate0 = remainder_func.empty_candidate_certificate(X) if reuse_candidate_certificate else ()
     carry0 = (i0, beta_ws, x0, u0, v0, w, y, rho, converged0, converged0, h_ct0, Phi_x_ws, Phi_u_ws, mu_ws, E_prev, r_center0, jnp.array(True), converged0, records0, certificate0)
+    disturbance_call = get_combined_disturbance.__wrapped__ if _host_dispatch else get_combined_disturbance
+    solve = constrained_solve_jit if _host_dispatch else constrained_solve
 
     def cond_fn(carry):
         i, _, _, _, _, _, _, _, converged, _, _, _, _, _, _, _, proof_valid, _, _, _ = carry
@@ -514,15 +517,21 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         bound_U = U+u_prev if candidate_centered else U
         if sls_config.enable_linearization_bounds:
             def evaluate_disturbance(_):
-                return get_combined_disturbance(E, bound_X, bound_U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center_input, disturbance_center, sls_config.remainder_uses_time, parameter)
+                return disturbance_call(E, bound_X, bound_U, Phi_x_prev, Phi_u_prev, remainder_func, splits_cfg, E_prev, r_center_input, disturbance_center, sls_config.remainder_uses_time, parameter)
             if reuse_candidate_certificate:
                 # At k+1, (X+dx_k,U+du_k,Phi_k,E_k,center_k) is exactly the
                 # query certified by candidate check k. Numerical parameters
                 # stay fixed within this call. Only the shared lift is repeated;
                 # the first query and every fresh candidate still run the oracle.
-                E_aug, r_center = lax.cond(i == 0, evaluate_disturbance,
-                    lambda _: remainder_func.combined_disturbance_from_certificate(
-                        E, bound_X, previous_certificate, disturbance_center), operand=None)
+                def pack_previous(_):
+                    return remainder_func.combined_disturbance_from_certificate(
+                        E, bound_X, previous_certificate, disturbance_center)
+
+                if _host_dispatch:
+                    call = evaluate_disturbance if int(i) == 0 else pack_previous
+                    E_aug, r_center = call(None)
+                else:
+                    E_aug, r_center = lax.cond(i == 0, evaluate_disturbance, pack_previous, operand=None)
             else:
                 E_aug, r_center = evaluate_disturbance(None)
         else:
@@ -545,7 +554,7 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         w   = lax.select(warm_flag, w, jnp.zeros_like(w))
         y   = lax.select(warm_flag, y, jnp.zeros_like(y))
         rho = lax.select(warm_flag, rho, jnp.array(cfg.initial_rho, dtype=rho.dtype))
-        x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = constrained_solve(
+        x_curr, u_curr, v_curr, w, y, rho, mu, converged_admm = solve(
             cfg, Q, q, R, r, M, A, B, c, C, D, tightened_constraints_all, w, y, rho
         )
 
@@ -587,9 +596,19 @@ def sls_solve_gpu(cfg, remainder_func, Q: jnp.ndarray, q: jnp.ndarray,
         return (i + jnp.array(1, dtype=jnp.int32),
                 beta, x_curr, u_curr, v_curr, w, y, rho, converged, converged_admm, h_ct, Phi_x, Phi_u, mu, E_aug, r_center, proof_valid, nominal_converged, records, previous_certificate)
 
-    carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
+    if _host_dispatch:
+        carryN = carry0
+        while bool(cond_fn(carryN)):
+            carryN = body_fn(carryN)
+    else:
+        carryN = jax.lax.while_loop(cond_fn, body_fn, carry0)
     count, betaN, xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, muN, EN, r_centerN, proof_valid, nominal_converged, records, _ = carryN
     result = (xN, uN, vN, wN, yN, rhoN, convergedN, converged_admm, h_ct, Phi_x, Phi_u, betaN, muN, EN, r_centerN)
     if closure_aware:
         return result+(jnp.stack((count, nominal_converged, proof_valid, convergedN)),)+((records,) if return_records else ())
     return result
+
+
+def sls_solve_host(*args, **kwargs):
+    """Schedule SLS rounds on the host so providers can dispatch compiled proofs."""
+    return sls_solve_gpu.__wrapped__(*args, **kwargs, _host_dispatch=True)
