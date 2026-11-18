@@ -6,4 +6,3 @@ build/
 __pycache__/
 *.pyc
 *.DS_Store
-examples/neural_tpusher/outputs

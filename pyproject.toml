@@ -10,20 +10,11 @@ authors = [{name="Jeffrey Fang"}]
 requires-python = ">=3.11"
 
 dependencies = [
-    "pycddlib",
-    "jax[cuda12]==0.8.1",
-    "mujoco",
-    "mujoco-mjx",
-    "gym-quadruped",
+    "jax>=0.8.1,<0.9",
     "trajax @ git+https://github.com/google/trajax",
     "numpy",
     "scipy",
-    "matplotlib",
-    "immrax[cuda] @ git+https://github.com/keyis2/immrax@upgrade_jax",
-    "hydra-core",
-    "jax_verify @ git+https://github.com/keyis2/jax_verify@master",
-    "pymunk",
-    "imageio"
+    "osqp",
 ]
 
 [tool.setuptools.packages.find]

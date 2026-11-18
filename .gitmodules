@@ -1,9 +1,3 @@
 [submodule "src/gpu_sls/external/primal_dual_ilqr"]
 	path = src/gpu_sls/external/primal_dual_ilqr
 	url = https://github.com/iit-DLSLab/primal_dual_ilqr.git
-[submodule "src/gpu_sls/external/ReachDev"]
-    path = src/gpu_sls/external/ReachDev
-    url = https://github.com/trustworthyrobotics/ReachDev.git
-[submodule "src/gpu_sls/external/linearization_error"]
-	path = src/gpu_sls/external/linearization_error
-	url = https://github.com/trustworthyrobotics/linearization_error.git
